@@ -79,5 +79,42 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 补全后明细数据集（补全工作台）
+
+「数据补全」不再直接改写采集记录原字段，而是生成**补全后明细数据集**，
+让补全值与来源证据同时落库，可追溯每个补全值的来源与发生时间。
+
+- 入口：前端侧边栏「补全工作台」（`/enrich-workbench`，视图
+  `frontend/src/views/EnrichWorkbench.vue`）
+- 存储：`store.enrich_details`（`EnrichDetailStore`，见 `backend/app/store.py`），
+  与采集记录 `collect_records` 分离，原值保持不变
+- 领域逻辑：`backend/app/services/data_enrich.py`、二次校验在
+  `backend/app/services/result_verify.py`
+- 路由：`backend/app/routers/enrich.py`，前缀 `/api/enrich`
+
+口径约束：
+
+- 读取采集记录与**已生效**补全规则，仅补全页面采集为空的字段；
+- 每条明细同时写入当前补全值、补全来源、来源版本、匹配键/匹配值、候选来源、
+  补全发生时间；同一记录同一字段只发布一个当前值，匹配键为空则跳过；
+- 两个外部来源给出不同值时，支持两种冲突处理（都只发布一个当前值）：
+  `latest` 按来源更新时间取较新值，`authority` 按配置的权威来源取指定值；
+- 结果校验按处理项寅口径、**按补全来源版本**重新校验受影响字段并回写明细；
+- 处理台账与结果清单联动核对，同一（批次, 处理类型）重复提交只保留一条结果，
+  待办同步给另一业务入口，重新补全沿用既有版本口径幂等覆盖。
+
+主要接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/enrich/details` | 按批次/字段/来源版本/校验状态筛选补全明细 |
+| GET | `/api/enrich/facets` | 批次、字段、来源版本筛选项与冲突配置 |
+| GET | `/api/enrich/stats` | 工作台统计（含二次校验视图） |
+| POST | `/api/enrich/run` | 按批次生成补全后明细数据集 |
+| POST | `/api/enrich/recheck` | 按补全来源版本二次校验受影响字段 |
+| GET/POST | `/api/enrich/config` | 查询/配置冲突处理方式与权威来源 |
+| GET | `/api/enrich/ledgers`、`/results`、`/todos`、`/cross-check` | 台账、结果清单、待办、联动核对 |
+| GET | `/api/enrich/export` | 导出含来源证据与候选来源的完整补全明细 CSV |
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

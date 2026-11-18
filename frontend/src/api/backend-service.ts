@@ -106,3 +106,132 @@ export async function loadRecoveryStats(): Promise<Record<string, unknown>> {
   if (!response.ok) throw new Error('恢复状态查询失败')
   return await response.json()
 }
+
+// ---- 数据补全工作台：补全后明细数据集（补全值 + 来源证据） ----
+
+export type EnrichDetail = {
+  detail_id: number
+  batch_ref: string
+  record_id: number
+  field_name: string
+  current_value: string
+  source: string
+  source_version: string
+  match_key: string
+  match_value: string
+  rule_id: number
+  rule_name: string
+  conflict_policy: string
+  enriched_at: string
+  candidates: {
+    source: string
+    source_version: string
+    value: string
+    match_key: string
+    source_updated_at: string
+  }[]
+  is_current: boolean
+  original_empty: boolean
+  recheck_status: string
+  recheck_reason: string
+  recheck_source_version: string | null
+  recheck_at: string | null
+}
+
+export type EnrichFacets = {
+  batches: string[]
+  fields: string[]
+  source_versions: string[]
+  config: { conflict_policy: string; authority_source: string }
+}
+
+async function enrichGet(path: string): Promise<Record<string, unknown>> {
+  const response = await request(`/api/enrich${path}`)
+  if (!response.ok) throw new Error('补全工作台数据读取失败')
+  return await response.json()
+}
+
+async function enrichPost(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await request(`/api/enrich${path}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}))
+    throw new Error(detail.detail ?? '补全工作台操作失败')
+  }
+  return await response.json()
+}
+
+/** 按批次/字段/来源版本/校验状态分页查询补全后明细 */
+export async function loadEnrichDetails(
+  filters: Record<string, string>,
+  page = 1,
+  size = 20,
+): Promise<{ items: EnrichDetail[]; total: number; page: number; size: number }> {
+  const query = new URLSearchParams({ ...filters, page: String(page), size: String(size) }).toString()
+  const response = await request(`/api/enrich/details?${query}`)
+  if (!response.ok) throw new Error('补全明细读取失败')
+  return await response.json()
+}
+
+export function loadEnrichFacets(): Promise<EnrichFacets> {
+  return enrichGet('/facets') as Promise<EnrichFacets>
+}
+
+export function loadEnrichStats(): Promise<Record<string, unknown>> {
+  return enrichGet('/stats')
+}
+
+/** 按批次生成补全后明细数据集（补全值与来源证据同时写入） */
+export function runEnrich(batchRef: string): Promise<Record<string, unknown>> {
+  return enrichPost('/run', { batch_ref: batchRef })
+}
+
+/** 结果校验按补全来源版本重新校验受影响字段 */
+export function runEnrichRecheck(batchRef: string): Promise<Record<string, unknown>> {
+  return enrichPost('/recheck', { batch_ref: batchRef })
+}
+
+export function loadEnrichLedgers(): Promise<{ items: Record<string, unknown>[]; total: number }> {
+  return enrichGet('/ledgers') as Promise<{ items: Record<string, unknown>[]; total: number }>
+}
+
+export function loadEnrichResults(): Promise<{ items: Record<string, unknown>[]; total: number }> {
+  return enrichGet('/results') as Promise<{ items: Record<string, unknown>[]; total: number }>
+}
+
+export function loadEnrichTodos(): Promise<{ items: Record<string, unknown>[]; total: number }> {
+  return enrichGet('/todos') as Promise<{ items: Record<string, unknown>[]; total: number }>
+}
+
+export function loadEnrichCrossCheck(): Promise<Record<string, unknown>> {
+  return enrichGet('/cross-check')
+}
+
+export function loadEnrichRecheckStats(): Promise<Record<string, unknown>> {
+  return enrichGet('/recheck/stats')
+}
+
+/** 配置冲突处理：latest=较新值，authority=权威来源指定值 */
+export function updateEnrichConfig(payload: {
+  conflict_policy?: string
+  authority_source?: string
+}): Promise<Record<string, unknown>> {
+  return enrichPost('/config', payload)
+}
+
+/** 导出完整补全明细（含来源证据与候选来源）CSV */
+export async function downloadEnrichDetails(filters: Record<string, string> = {}): Promise<void> {
+  const query = new URLSearchParams(filters).toString()
+  const response = await request(`/api/enrich/export?${query}`)
+  if (!response.ok) throw new Error('补全明细导出失败')
+  const url = URL.createObjectURL(await response.blob())
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = 'enrich_details.csv'
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  URL.revokeObjectURL(url)
+}

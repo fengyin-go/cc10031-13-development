@@ -219,6 +219,172 @@ class ResultVerifyService(BaseModuleService):
 
         return self._validate_record(record, rules)
 
+    # ---- 补全后明细二次校验（处理项寅口径，按补全来源版本） ----
+
+    def recheck_enriched_details(self, batch_ref: str | None = None) -> dict[str, Any]:
+        """加载处理项寅关联的补全后明细数据集，按补全来源版本重新校验受影响字段。
+
+        - 数据来源：``store.enrich_details`` 的当前补全值（不重复采集、不改写原记录）；
+        - 按 ``source_version`` 分组，沿用结果校验模块既有规则口径逐条校验受影响字段；
+        - 校验结果（通过/不通过、原因、来源版本、发生时间）回写到同一条补全明细；
+        - 同一批次重复提交只保留一条 recheck 结果（结果清单按 批次+处理类型 去重）；
+        - 处理台账与结果清单联动核对，完成后关闭待办并发布 ``rpa.enrich_rechecked`` 事件。
+
+        Returns:
+            按来源版本汇总的二次校验结果
+        """
+        checked_at = datetime.now(timezone.utc).isoformat()
+        details = store.enrich_details.list_current_raw(batch_ref)
+        if not details:
+            return {
+                "batch_ref": batch_ref, "checked": 0, "passed": 0,
+                "failed": 0, "by_source_version": {}, "batches": [],
+            }
+
+        verify_rules = self._get_active_rules()
+        batches: list[str] = []
+        total_checked = total_pass = total_fail = 0
+        by_version: dict[str, dict[str, Any]] = {}
+
+        for detail in details:
+            target_batch = detail.batch_ref
+            if target_batch not in batches:
+                batches.append(target_batch)
+
+            rule = self._match_verify_rule(detail.field_name, verify_rules)
+            status, reason = self._recheck_one(detail, rule)
+
+            store.enrich_details.apply_recheck(
+                detail.detail_id, status, reason,
+                detail.source_version, checked_at)
+
+            bucket = by_version.setdefault(detail.source_version, {
+                "source": detail.source,
+                "source_version": detail.source_version,
+                "checked": 0, "passed": 0, "failed": 0,
+                "fields": set(),
+            })
+            bucket["checked"] += 1
+            bucket["fields"].add(detail.field_name)
+            total_checked += 1
+            if status == "校验通过":
+                bucket["passed"] += 1
+                total_pass += 1
+            else:
+                bucket["failed"] += 1
+                total_fail += 1
+
+        # set 转为可序列化列表
+        for bucket in by_version.values():
+            bucket["fields"] = sorted(bucket["fields"])
+
+        affected_batches = batches if batch_ref is None else [batch_ref]
+        for target_batch in affected_batches:
+            # 重复提交只保留一条结果
+            store.enrich_details.publish_result({
+                "batch_ref": target_batch,
+                "process_type": "recheck",
+                "checked": sum(
+                    1 for d in details if d.batch_ref == target_batch),
+                "passed": sum(
+                    1 for d in details
+                    if d.batch_ref == target_batch and d.recheck_status == "校验通过"),
+                "failed": sum(
+                    1 for d in details
+                    if d.batch_ref == target_batch and d.recheck_status == "校验不通过"),
+                "source_versions": sorted({
+                    d.source_version for d in details if d.batch_ref == target_batch}),
+                "processed_at": checked_at,
+            })
+            store.enrich_details.add_ledger({
+                "batch_ref": target_batch,
+                "process_type": "recheck",
+                "action": "按补全来源版本二次校验受影响字段",
+                "processed_at": checked_at,
+            })
+            # 处理台账与结果清单联动核对
+            cross_check = store.enrich_details.cross_check()
+            # 关闭另一业务入口的待办
+            store.enrich_details.resolve_todo(target_batch, "recheck")
+            store.channel.publish(
+                topic="rpa.enrich_rechecked",
+                source=self.MODULE,
+                payload={
+                    "batch_ref": target_batch,
+                    "checked": sum(
+                        1 for d in details if d.batch_ref == target_batch),
+                    "passed": sum(
+                        1 for d in details
+                        if d.batch_ref == target_batch and d.recheck_status == "校验通过"),
+                    "failed": sum(
+                        1 for d in details
+                        if d.batch_ref == target_batch and d.recheck_status == "校验不通过"),
+                    "cross_check_consistent": cross_check["consistent"],
+                    "timestamp": checked_at,
+                },
+            )
+
+        return {
+            "batch_ref": batch_ref,
+            "checked": total_checked,
+            "passed": total_pass,
+            "failed": total_fail,
+            "by_source_version": by_version,
+            "batches": batches,
+            "cross_check": store.enrich_details.cross_check(),
+        }
+
+    def _match_verify_rule(
+        self,
+        field_name: str,
+        verify_rules: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """按校验字段匹配补全字段对应的已启用校验规则；无精确匹配时取非空兜底规则。"""
+        for rule in verify_rules:
+            if rule.get("field") == field_name:
+                return rule
+        for rule in verify_rules:
+            if rule.get("pattern") == "non_empty":
+                return rule
+        return verify_rules[0] if verify_rules else None
+
+    @staticmethod
+    def _recheck_one(
+        detail: Any,
+        rule: dict[str, Any] | None,
+    ) -> tuple[str, str]:
+        """按单条校验规则口径校验一个补全值（确定性，不使用随机抽样）。
+
+        Returns:
+            (校验状态, 原因说明)
+        """
+        value = str(detail.current_value or "").strip()
+        if not value:
+            return "校验不通过", f"字段[{detail.field_name}]补全值为空"
+        if rule is None:
+            # 无可用校验规则：非空即通过（沿用既有“无匹配规则视为通过”口径）
+            return "校验通过", "无校验规则匹配，非空通过"
+
+        condition = rule.get("condition")
+        if condition == "numeric" and not value.replace(".", "").isdigit():
+            return "校验不通过", f"字段[{detail.field_name}]不是数值"
+        if condition == "length_gt_0" and len(value) == 0:
+            return "校验不通过", f"字段[{detail.field_name}]长度为零"
+        return "校验通过", f"按来源版本{detail.source_version}校验通过"
+
+    def get_enrich_recheck_stats(self) -> dict[str, Any]:
+        """补全后明细二次校验统计，供概览看板结果视图使用。"""
+        snapshot = store.enrich_details.snapshot()
+        return {
+            "enrich_detail_total": snapshot["total"],
+            "recheck_pending": snapshot["recheck_pending"],
+            "recheck_pass": snapshot["recheck_pass"],
+            "recheck_fail": snapshot["recheck_fail"],
+            "source_versions": snapshot["source_versions"],
+            "cross_check": store.enrich_details.cross_check(),
+            "todos_open": snapshot["todo_open"],
+        }
+
     def get_validation_stats(self) -> dict[str, Any]:
         """获取校验统计概览。"""
         validate_events = store.channel.snapshot(topic="rpa.validation_complete")
@@ -236,4 +402,4 @@ class ResultVerifyService(BaseModuleService):
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         stats = self.get_validation_stats()
-        return {**base, **stats}
+        return {**base, **stats, "enrich_recheck": self.get_enrich_recheck_stats()}

@@ -276,6 +276,340 @@ class CollectRecordStore:
 
 
 # ---------------------------------------------------------------------------
+# 补全后明细数据集 (EnrichDetailStore)
+# 补全值与来源证据同时落库，不再直接改写采集记录原字段
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EnrichCandidate:
+    """外部数据源给出的单个候选补全值（来源证据）。"""
+    source: str
+    source_version: str
+    value: str
+    match_key: str
+    source_updated_at: str
+
+
+@dataclass
+class EnrichDetail:
+    """补全后明细：同一采集记录的同一字段只发布一个当前值（is_current=True）。
+
+    补全值与来源证据（来源、来源版本、匹配键、候选来源、发生时间）同行存储，
+    二次校验结果按补全来源版本回写到同一条明细。
+    """
+    detail_id: int
+    batch_ref: str
+    record_id: int
+    field_name: str
+    current_value: str
+    source: str
+    source_version: str
+    match_key: str
+    match_value: str
+    rule_id: int
+    rule_name: str
+    conflict_policy: str
+    enriched_at: str
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    is_current: bool = True
+    original_empty: bool = True
+    # 二次校验（按处理项寅口径、按补全来源版本）
+    recheck_status: str = "待校验"
+    recheck_reason: str = ""
+    recheck_source_version: str | None = None
+    recheck_at: str | None = None
+
+
+class EnrichDetailStore:
+    """补全后明细数据集存储 + 处理台账/结果清单/待办联动。
+
+    用法::
+
+        store.enrich_details.upsert_detail(detail_dict)
+        rows, total = store.enrich_details.list_details({"batch_ref": "B1"})
+    """
+
+    def __init__(self) -> None:
+        # 可重入锁：update_config 等方法持锁后会内部复用 config_snapshot() 等带锁方法
+        self._lock = threading.RLock()
+        self._seq = 0
+        self._details: list[EnrichDetail] = []
+        # 处理台账：每次处理动作一条
+        self._ledgers: list[dict[str, Any]] = []
+        # 结果清单：同一(批次, 处理类型)重复提交只保留一条结果
+        self._results: list[dict[str, Any]] = []
+        # 待办：另一个业务入口消费
+        self._todos: list[dict[str, Any]] = []
+        # 冲突处理配置：latest=按来源更新时间取较新值，authority=按权威来源取指定值
+        self.conflict_policy = "latest"
+        self.authority_source = "企业主数据中心(MDM)"
+
+    # ---- 配置 ----
+
+    def update_config(self, conflict_policy: str | None = None,
+                      authority_source: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            if conflict_policy in ("latest", "authority"):
+                self.conflict_policy = conflict_policy
+            if authority_source:
+                self.authority_source = authority_source
+            return self.config_snapshot()
+
+    def config_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "conflict_policy": self.conflict_policy,
+                "authority_source": self.authority_source,
+            }
+
+    # ---- 补全后明细 ----
+
+    def upsert_detail(self, payload: dict[str, Any]) -> EnrichDetail:
+        """按 (record_id, field_name) 幂等写入：同一字段只保留一个当前值。
+
+        重复补全时覆盖旧明细（沿用既有版本口径，来源版本一并更新），
+        不新增第二行，保证一个字段只有一个当前值。
+        """
+        with self._lock:
+            for detail in self._details:
+                if (detail.record_id == payload["record_id"]
+                        and detail.field_name == payload["field_name"]):
+                    payload_detail = self._build_detail(detail.detail_id, payload)
+                    self._details[self._details.index(detail)] = payload_detail
+                    return payload_detail
+            self._seq += 1
+            detail = self._build_detail(self._seq, payload)
+            self._details.append(detail)
+            return detail
+
+    def _build_detail(self, detail_id: int, payload: dict[str, Any]) -> EnrichDetail:
+        return EnrichDetail(
+            detail_id=detail_id,
+            batch_ref=payload["batch_ref"],
+            record_id=payload["record_id"],
+            field_name=payload["field_name"],
+            current_value=payload["current_value"],
+            source=payload["source"],
+            source_version=payload["source_version"],
+            match_key=payload["match_key"],
+            match_value=payload["match_value"],
+            rule_id=payload["rule_id"],
+            rule_name=payload["rule_name"],
+            conflict_policy=payload["conflict_policy"],
+            enriched_at=payload["enriched_at"],
+            candidates=list(payload.get("candidates", [])),
+            is_current=True,
+            original_empty=bool(payload.get("original_empty", True)),
+            recheck_status=payload.get("recheck_status", "待校验"),
+            recheck_reason=payload.get("recheck_reason", ""),
+            recheck_source_version=payload.get("recheck_source_version"),
+            recheck_at=payload.get("recheck_at"),
+        )
+
+    def list_details(
+        self,
+        *,
+        batch_ref: str | None = None,
+        field_name: str | None = None,
+        source_version: str | None = None,
+        source: str | None = None,
+        recheck_status: str | None = None,
+        keyword: str | None = None,
+        page: int = 1,
+        size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        with self._lock:
+            rows = [self._to_dict(d) for d in self._details if d.is_current]
+        if batch_ref:
+            rows = [r for r in rows if r["batch_ref"] == batch_ref]
+        if field_name:
+            rows = [r for r in rows if field_name.casefold() in r["field_name"].casefold()]
+        if source_version:
+            rows = [r for r in rows if r["source_version"] == source_version]
+        if source:
+            rows = [r for r in rows if source.casefold() in r["source"].casefold()]
+        if recheck_status:
+            rows = [r for r in rows if r["recheck_status"] == recheck_status]
+        if keyword:
+            kw = keyword.casefold()
+            rows = [
+                r for r in rows
+                if kw in r["current_value"].casefold()
+                or kw in r["match_value"].casefold()
+                or kw in r["field_name"].casefold()
+            ]
+        total = len(rows)
+        start = (page - 1) * size
+        return rows[start:start + size], total
+
+    def list_current_raw(self, batch_ref: str | None = None) -> list[EnrichDetail]:
+        with self._lock:
+            rows = [d for d in self._details if d.is_current]
+        if batch_ref:
+            rows = [d for d in rows if d.batch_ref == batch_ref]
+        return rows
+
+    def current_value(self, record_id: int, field_name: str) -> dict[str, Any] | None:
+        with self._lock:
+            for d in self._details:
+                if d.record_id == record_id and d.field_name == field_name and d.is_current:
+                    return self._to_dict(d)
+        return None
+
+    def apply_recheck(self, detail_id: int, status: str,
+                      reason: str, source_version: str, checked_at: str) -> bool:
+        with self._lock:
+            for d in self._details:
+                if d.detail_id == detail_id:
+                    d.recheck_status = status
+                    d.recheck_reason = reason
+                    d.recheck_source_version = source_version
+                    d.recheck_at = checked_at
+                    return True
+        return False
+
+    def distinct_versions(self) -> list[str]:
+        with self._lock:
+            return sorted({d.source_version for d in self._details if d.is_current})
+
+    def distinct_batches(self) -> list[str]:
+        with self._lock:
+            return sorted({d.batch_ref for d in self._details if d.is_current})
+
+    def distinct_fields(self) -> list[str]:
+        with self._lock:
+            return sorted({d.field_name for d in self._details if d.is_current})
+
+    # ---- 处理台账 / 结果清单 / 待办 ----
+
+    def add_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            entry = dict(entry)
+            entry.setdefault("ledger_id", len(self._ledgers) + 1)
+            self._ledgers.append(entry)
+            return entry
+
+    def list_ledgers(self, batch_ref: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = list(self._ledgers)
+        if batch_ref:
+            rows = [r for r in rows if r.get("batch_ref") == batch_ref]
+        return rows
+
+    def publish_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """发布处理结果：同一(批次, 处理类型)重复提交只保留一条结果。"""
+        with self._lock:
+            key = (result.get("batch_ref"), result.get("process_type"))
+            for existing in self._results:
+                if (existing.get("batch_ref"), existing.get("process_type")) == key:
+                    existing.clear()
+                    existing.update(result)
+                    return existing
+            self._results.append(dict(result))
+            return dict(result)
+
+    def list_results(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._results)
+
+    def upsert_todo(self, todo: dict[str, Any]) -> dict[str, Any]:
+        """待办按 (batch_ref, todo_type) 去重，另一个业务入口跟着更新。"""
+        with self._lock:
+            key = (todo.get("batch_ref"), todo.get("todo_type"))
+            for existing in self._todos:
+                if (existing.get("batch_ref"), existing.get("todo_type")) == key:
+                    existing.update(todo)
+                    return existing
+            todo = dict(todo)
+            todo.setdefault("todo_id", len(self._todos) + 1)
+            self._todos.append(todo)
+            return todo
+
+    def resolve_todo(self, batch_ref: str, todo_type: str) -> bool:
+        with self._lock:
+            for todo in self._todos:
+                if todo.get("batch_ref") == batch_ref and todo.get("todo_type") == todo_type:
+                    todo["status"] = "已完成"
+                    todo["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                    return True
+        return False
+
+    def list_todos(self, include_done: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = list(self._todos)
+        if not include_done:
+            rows = [r for r in rows if r.get("status") != "已完成"]
+        return rows
+
+    def cross_check(self) -> dict[str, Any]:
+        """处理台账与结果清单联动核对：每个已发布结果必须有对应台账记录。"""
+        with self._lock:
+            ledgers = list(self._ledgers)
+            results = list(self._results)
+        ledger_keys = {(l.get("batch_ref"), l.get("process_type")) for l in ledgers}
+        orphan = [
+            r for r in results
+            if (r.get("batch_ref"), r.get("process_type")) not in ledger_keys
+        ]
+        return {
+            "ledger_count": len(ledgers),
+            "result_count": len(results),
+            "consistent": not orphan,
+            "orphan_results": orphan,
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            details = [d for d in self._details if d.is_current]
+            total_candidates = sum(len(d.candidates) for d in details)
+            recheck_pass = sum(1 for d in details if d.recheck_status == "校验通过")
+            recheck_fail = sum(1 for d in details if d.recheck_status == "校验不通过")
+            recheck_pending = sum(1 for d in details if d.recheck_status == "待校验")
+            return {
+                "total": len(details),
+                "candidate_total": total_candidates,
+                "batches": len({d.batch_ref for d in details}),
+                "fields": len({d.field_name for d in details}),
+                "source_versions": sorted({d.source_version for d in details}),
+                "recheck_pending": recheck_pending,
+                "recheck_pass": recheck_pass,
+                "recheck_fail": recheck_fail,
+                "ledger_total": len(self._ledgers),
+                "result_total": len(self._results),
+                "todo_open": sum(1 for t in self._todos if t.get("status") != "已完成"),
+                "config": {
+                    "conflict_policy": self.conflict_policy,
+                    "authority_source": self.authority_source,
+                },
+            }
+
+    @staticmethod
+    def _to_dict(d: EnrichDetail) -> dict[str, Any]:
+        return {
+            "detail_id": d.detail_id,
+            "batch_ref": d.batch_ref,
+            "record_id": d.record_id,
+            "field_name": d.field_name,
+            "current_value": d.current_value,
+            "source": d.source,
+            "source_version": d.source_version,
+            "match_key": d.match_key,
+            "match_value": d.match_value,
+            "rule_id": d.rule_id,
+            "rule_name": d.rule_name,
+            "conflict_policy": d.conflict_policy,
+            "enriched_at": d.enriched_at,
+            "candidates": list(d.candidates),
+            "is_current": d.is_current,
+            "original_empty": d.original_empty,
+            "recheck_status": d.recheck_status,
+            "recheck_reason": d.recheck_reason,
+            "recheck_source_version": d.recheck_source_version,
+            "recheck_at": d.recheck_at,
+        }
+
+
+# ---------------------------------------------------------------------------
 # 失败恢复管理 (FailureRecovery)
 # ---------------------------------------------------------------------------
 
@@ -372,6 +706,8 @@ class Store:
         self.dirty_vault = DirtyDataVault()
         self.collect_records = CollectRecordStore()
         self.recovery = FailureRecovery()
+        self.enrich_details = EnrichDetailStore()
+        _bootstrap_demo_collect_records(self)
 
     # ---- 基础数据操作 ----
 
@@ -405,5 +741,37 @@ class Store:
         ]
         return {"cards": cards, "modules": modules}
 
+
+def _bootstrap_demo_collect_records(target_store: "Store") -> None:
+    """写入演示采集批次：部分目标字段为空，供补全工作台直接演示来源证据。
+
+    与 data_enrich 种子规则的「目标字段/匹配键」口径保持一致；
+    每条记录保留页面采集原值，补全值只写入 EnrichDetailStore，不改写原字段。
+    """
+    if target_store.collect_records.count:
+        return
+    base_time = "2026-11-18T02:00:00+00:00"
+    demo_rows = [
+        # 批次1：工商信息补全（企业名称/统一社会信用代码 有值可作匹配键，行业分类/注册地址为空）
+        {"企业名称": "杭州云栖科技有限公司", "统一社会信用代码": "91330106MA27H1AA01",
+         "行业分类": "", "注册地址": "", "采集页面": "企业信用公示页"},
+        {"企业名称": "上海临港制造股份有限公司", "统一社会信用代码": "91310115MA1K3BB02",
+         "行业分类": "", "注册地址": "上海市浦东新区临港大道100号", "采集页面": "企业信用公示页"},
+        {"企业名称": "深圳前海贸易有限公司", "统一社会信用代码": "91440300MA5ECX03",
+         "行业分类": "批发业", "注册地址": "", "采集页面": "企业信用公示页"},
+        # 批次2：商品信息补全（商品编码/品牌 有值，规格型号/生产厂家为空）
+        {"商品名称": "工业级温湿度传感器", "商品编码": "SKU-TH-2026-001", "品牌": "云栖",
+         "规格型号": "", "生产厂家": "", "采集页面": "商品详情页"},
+        {"商品名称": "智能网关设备", "商品编码": "SKU-GW-2026-002", "品牌": "临港",
+         "规格型号": "GW-X9", "生产厂家": "", "采集页面": "商品详情页"},
+        {"商品名称": "高精度数控模组", "商品编码": "", "品牌": "临工",
+         "规格型号": "", "生产厂家": "上海临港制造股份有限公司", "采集页面": "商品详情页"},
+    ]
+    batches = ["BATC-DEMO-20261118-01", "BATC-DEMO-20261118-02"]
+    for index, row in enumerate(demo_rows):
+        batch_ref = batches[0] if index < 3 else batches[1]
+        entry = target_store.collect_records.add(
+            batch_ref=batch_ref, source="data_extract", fields=dict(row))
+        entry.collected_at = base_time
 
 store = Store()
